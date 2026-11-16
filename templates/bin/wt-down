@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# wt-down : arrête et supprime la stack Docker de ce worktree, volumes compris.
+#
+# À copier dans bin/ du dépôt du projet, puis à brancher sur scripts.archive
+# d'orca.yaml. Orca lance le script avec le worktree comme dossier courant.
+set -euo pipefail
+
+worktree="${ORCA_WORKTREE_PATH:-$PWD}"
+cd "$worktree"
+env_file=".wt.env"
+
+if [ ! -f "$env_file" ]; then
+  echo "wt-down : aucun $env_file, rien à arrêter."
+  exit 0
+fi
+
+project="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$env_file")"
+[ -n "$project" ] || { echo "wt-down : COMPOSE_PROJECT_NAME absent de $env_file." >&2; exit 1; }
+
+docker compose --env-file "$env_file" -p "$project" down -v --remove-orphans
+rm -f "$env_file"
+echo "wt-down : projet $project supprimé."

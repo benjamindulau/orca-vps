@@ -1,0 +1,13 @@
+# Exemple d'orca.yaml, à placer à la racine du dépôt du projet avec
+# bin/wt-up et bin/wt-down. Ajoute .wt.env au .gitignore du projet.
+#
+# - setup est lu dans le orca.yaml du nouveau worktree ;
+# - archive est lu dans le orca.yaml du checkout principal, et s'exécute avec
+#   le worktree comme dossier courant ;
+# - wait-for-setup fait attendre l'agent jusqu'à la fin de wt-up.
+scripts:
+  setup: |
+    bin/wt-up
+  archive: |
+    bin/wt-down
+setupAgentStartupPolicy: wait-for-setup
