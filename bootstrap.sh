@@ -728,6 +728,7 @@ write_service_env() {
   } | user_write "$ORCA_HOME/.config/orca-vps/service.env" 600
   {
     printf '# Géré par orca-vps (bootstrap.sh).\n[Service]\n'
+    printf 'UnsetEnvironment=DO_NOT_TRACK\n'
     printf 'EnvironmentFile=%s\n' "$ORCA_HOME/.config/orca-vps/service.env"
     printf 'EnvironmentFile=-%s\n' "$ORCA_HOME/.config/orca-vps/claude.env"
   } | user_write "$dropin" 644
@@ -764,14 +765,60 @@ wait_for_orca_port() {
   die "le serveur Orca n'écoute pas sur le port $ORCA_PORT après 30 s."
 }
 
+# Une installation manuelle a pu définir DO_NOT_TRACK pour l'utilisateur :
+# on le retire de sa session systemd et de ses fichiers de shell, sinon les
+# terminaux d'Orca le transmettent à Claude Code.
+purge_do_not_track() {
+  local file
+  for file in "$ORCA_HOME"/.config/environment.d/*.conf "$ORCA_HOME/.bashrc" "$ORCA_HOME/.profile" "$ORCA_HOME/.bash_profile"; do
+    [ -f "$file" ] || continue
+    grep -q 'DO_NOT_TRACK=' "$file" || continue
+    as_user sed -i -E \
+      -e '/^[[:space:]]*(export[[:space:]]+)?DO_NOT_TRACK=[^[:space:]]*[[:space:]]*$/d' \
+      -e 's/[[:space:]]+DO_NOT_TRACK=[^[:space:]]*//g' "$file"
+    info "DO_NOT_TRACK retiré de $file."
+  done
+  as_user systemctl --user unset-environment DO_NOT_TRACK 2>/dev/null || true
+  return 0
+}
+
+# Vrai si la session systemd de l'utilisateur voit déjà le groupe docker.
+# Elle garde les groupes qu'elle avait à son démarrage : un ajout ultérieur
+# au groupe n'atteint ses services qu'après une relance de la session.
+manager_has_docker_group() {
+  local gid pid
+  [ "$DOCKER_MODE" = group ] || return 0
+  gid="$(getent group docker | cut -d: -f3)"
+  [ -n "$gid" ] || return 0
+  grep -qx "$gid" <<<"$(id -G "$ORCA_USER" | tr ' ' '\n')" || return 0
+  pid="$(systemctl show "user@$ORCA_UID.service" -p MainPID --value 2>/dev/null || true)"
+  [ -n "$pid" ] && [ "$pid" != 0 ] || return 0
+  grep -qx "$gid" <<<"$(grep -E '^Groups:' "/proc/$pid/status" | tr -s '[:space:]' '\n')"
+}
+
+# À appeler service Orca arrêté. Relancer la session ferme tous les
+# processus de l'utilisateur : on ne le fait pas sous des agents en cours,
+# sauf demande explicite (update-orca, après confirmation).
+refresh_user_manager_groups() {
+  local running
+  manager_has_docker_group && return 0
+  running="$(pgrep -c -u "$ORCA_USER" -x claude || true)"
+  if [ "${running:-0}" -gt 0 ] && [ "${ALLOW_SESSION_RESTART:-0}" -ne 1 ]; then
+    warn "le service Orca ne verra pas le groupe docker : $running session(s) Claude en cours empêchent de relancer la session de $ORCA_USER. Quand elles sont finies : orca-vps update-orca --force."
+    return 0
+  fi
+  info "Session systemd de $ORCA_USER relancée pour prendre le groupe docker (ses terminaux ouverts sont fermés)."
+  systemctl restart "user@$ORCA_UID.service"
+  ensure_user_manager
+}
+
 install_orca_service() {
   local args=(serve service install --port "$ORCA_PORT" --refuse-public)
   [ "$ORCA_INSTALL_METHOD" != tarball ] || args+=(--command "$ORCA_TARBALL_DIR/bin/orca-ide")
   ensure_user_manager
+  purge_do_not_track
+  refresh_user_manager_groups
   write_service_env
-  # Une installation manuelle a pu laisser cette variable dans la session
-  # systemd de l'utilisateur.
-  as_user systemctl --user unset-environment DO_NOT_TRACK 2>/dev/null || true
   as_user orca-ide "${args[@]}"
   as_user systemctl --user daemon-reload
   wait_for_orca_port
@@ -1125,7 +1172,7 @@ gh_logged_in() { as_user gh api user --jq .login >/dev/null 2>&1; }
 
 # Vrai si GitHub reconnaît la clé SSH de l'agent.
 agent_key_on_github() {
-  grep -q 'successfully authenticated' <<<"$(as_user ssh -T -o BatchMode=yes -o ConnectTimeout=15 git@github.com 2>&1 || true)"
+  grep -q 'successfully authenticated' <<<"$(as_user ssh -T -o BatchMode=yes -o ConnectTimeout=15 git@github.com </dev/null 2>&1 || true)"
 }
 
 # Connecte la CLI GitHub (gh) sous l'utilisateur Orca : les agents s'en
@@ -1359,10 +1406,11 @@ phase_service() {
   local before after
   resolve_user
   ensure_user_manager
+  purge_do_not_track
   before="$(service_fingerprint)"
   write_service_env
   after="$(service_fingerprint)"
-  if orca_service_active && [ "$before" = "$after" ] && [ -n "$(port_pid)" ] \
+  if orca_service_active && [ "$before" = "$after" ] && [ -n "$(port_pid)" ] && manager_has_docker_group \
      && grep -q -- "--port $ORCA_PORT" "$ORCA_HOME/.config/systemd/user/$ORCA_UNIT" 2>/dev/null; then
     info "Service Orca : déjà actif sur le port $ORCA_PORT, non relancé."
     return 0
@@ -1623,6 +1671,11 @@ cmd_verify() {
     grep -qx 'ORCA_TELEMETRY_DISABLED=1' <<<"$env_dump"; verdict $? "Service : ORCA_TELEMETRY_DISABLED=1" "Service : ORCA_TELEMETRY_DISABLED=1 absent de l'environnement"
     grep -E '^PATH=' <<<"$env_dump" | grep -q "$ORCA_HOME/.local/bin"; verdict $? "Service : PATH contient ~/.local/bin" "Service : ~/.local/bin absent du PATH"
     if grep -q '^DO_NOT_TRACK=' <<<"$env_dump"; then ko "Service : DO_NOT_TRACK est défini (à retirer)"; else ok "Service : DO_NOT_TRACK non défini"; fi
+    if grep -qs 'DO_NOT_TRACK=' "$ORCA_HOME/.bashrc" "$ORCA_HOME/.profile" "$ORCA_HOME"/.config/environment.d/*.conf; then
+      ko "Shells de $ORCA_USER : DO_NOT_TRACK est défini (orca-vps install --only service)"
+    else
+      ok "Shells de $ORCA_USER : DO_NOT_TRACK non défini"
+    fi
     if [ "$DOCKER_MODE" = group ]; then
       if grep -E '^Groups:' "/proc/$pid/status" | tr -s '[:space:]' '\n' | grep -qx "$(getent group docker | cut -d: -f3)"; then
         ok "Service : groupe docker visible par les agents"
@@ -1656,7 +1709,7 @@ cmd_verify() {
   if claude_logged_in; then ok "Claude Code : authentifié (mode $CLAUDE_AUTH)"; else caution "Claude Code : pas encore connecté (orca-vps claude-login)"; fi
 
   # Git
-  out="$(as_user ssh -T -o BatchMode=yes -o ConnectTimeout=15 git@github.com 2>&1)"
+  out="$(as_user ssh -T -o BatchMode=yes -o ConnectTimeout=15 git@github.com </dev/null 2>&1)"
   if grep -q 'successfully authenticated' <<<"$out"; then
     ok "Identité Git : GitHub salue $(sed -n 's/^Hi \([^!]*\)!.*/\1/p' <<<"$out")"
   elif grep -qi 'permission denied' <<<"$out"; then
@@ -1810,6 +1863,7 @@ cmd_update_orca() {
   orca_install_package
 
   log "Redémarrage en service sous $ORCA_USER"
+  ALLOW_SESSION_RESTART=1
   install_orca_service
 
   as_user orca-ide serve service status || true
