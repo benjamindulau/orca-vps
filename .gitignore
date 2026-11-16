@@ -1,0 +1,7 @@
+# Secrets et fichiers générés : jamais dans le dépôt.
+config.env
+out/
+*.key
+*.conf
+*.log
+.DS_Store
