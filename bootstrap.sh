@@ -185,6 +185,8 @@ load_config() {
   DOCKER_MODE="${DOCKER_MODE:-group}"
   SWAP_SIZE="${SWAP_SIZE:-4G}"
   TIMEZONE="${TIMEZONE:-Europe/Paris}"
+  EXTRA_PACKAGES="${EXTRA_PACKAGES:-}"
+  [[ "$EXTRA_PACKAGES" =~ ^[a-z0-9.+\ -]*$ ]] || die "EXTRA_PACKAGES : noms de paquets invalides."
   SSH_KEYS_FROM="${SSH_KEYS_FROM:-}"
 
   [[ "$ORCA_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "ORCA_USER invalide : $ORCA_USER"
@@ -868,7 +870,12 @@ phase_system() {
   apt-get upgrade -y -q -o DPkg::Lock::Timeout=300 \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
   apt_install git curl ca-certificates openssl ufw wireguard qrencode jq unattended-upgrades iproute2 \
-    adduser openssh-client iptables
+    adduser openssh-client iptables make unzip
+  if [ -n "$EXTRA_PACKAGES" ]; then
+    # shellcheck disable=SC2086  # liste de paquets séparés par des espaces
+    apt_install $EXTRA_PACKAGES
+    info "Paquets supplémentaires installés : $EXTRA_PACKAGES"
+  fi
 
   # Correctifs de sécurité automatiques, sans redémarrage automatique
   # (un redémarrage couperait les agents en cours).
